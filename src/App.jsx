@@ -23,7 +23,7 @@ const fragmentShader = `
   uniform int   uFrame;      
 
   uniform float uAspect;
-  uniform float uDitherEnabled; // ✨ bool -> float 변환 (드라이버 크래시 방지)
+  uniform float uDitherEnabled; 
   uniform float uNoiseDensity;
   uniform float uNoiseAmount;
   uniform float uContrast;
@@ -405,7 +405,6 @@ const fragmentShader = `
       }
     }
 
-    // ✨ NaN 방어 1차: uGamma 연산 중 음수로 인한 NaN 방지
     vec3 lin = uLinearize ? pow(max(rawRgb, vec3(0.0)), vec3(2.2)) : max(rawRgb, vec3(0.0));
     lin += flare * uFlareAmount;
     lin += halation * uHalation;
@@ -429,7 +428,6 @@ const fragmentShader = `
       lin *= (1.0 - comp * 0.5);
     }
     
-    // ✨ NaN 방어 2차: uHighlights 계산 시 음수 방지
     lin = pow(max(lin, vec3(0.0)), vec3(1.0 / max(uHighlights, 0.01)));
     lin = toneMap(lin);
 
@@ -521,7 +519,6 @@ const fragmentShader = `
 
     vec3 final;
 
-    // ✨ float 비교로 드라이버 충돌 회피
     if (uDitherEnabled > 0.5) {
       if (uColorMode) {
         final.r = ditherChannel(contrastCol.r, noiseR, safeNoiseAmt, uLevels, edgeSoftness);
@@ -615,7 +612,6 @@ const fragmentShader = `
       final = mix(final, clamp(soft, 0.0, 1.0), uPatternIntensity);
     }
 
-    // ✨ NaN 방어 최종: 오염된 픽셀을 블랙 처리해 TAA 버퍼로 퍼지는 것을 원천 차단
     bvec3 isN = isnan(final);
     if (any(isN)) {
       final = vec3(0.0);
@@ -651,7 +647,6 @@ const blendFragmentShader = `
     vec4 current  = texture(uCurrentFrame, vUv);
     vec4 previous = texture(uPreviousFrame, vUv);
     
-    // ✨ TAA 방어: 혹시 모를 에러 버퍼 병합 방지
     if (isnan(previous.r) || isnan(previous.g) || isnan(previous.b)) previous = current;
     if (isnan(current.r) || isnan(current.g) || isnan(current.b)) current = vec4(0.0);
 
@@ -671,7 +666,7 @@ const DitherMaterial = shaderMaterial(
   {
     uTexture: null, uBlueNoise: null, uLUT3D: null,
     uTime: 0, uEffectTime: 0, uFrame: 0, uAspect: 1.0,
-    uDitherEnabled: 1.0, // float
+    uDitherEnabled: 1.0,
     uNoiseDensity: 30.0, uNoiseAmount: 0.5,
     uContrast: 1.0, uBrightness: 0.0,
     uLevels: 4.0, uSoftness: 0.1,
@@ -751,17 +746,17 @@ const EngineCore = ({ texture, bNoise, lut3D, patternTex, params, aspect, saveRe
   const targetB    = useFBO(size.width, size.height, fboSettings);
   const currentFbo = useFBO(size.width, size.height, fboSettings);
   const isTargetA    = useRef(true);
-  const isFirstFrame = useRef(true);
+  
+  const resetTaaFlag = useRef(true); 
   
   const frameRef = useRef(0);
   const effectTimeRef = useRef(0);
   const settleCountRef = useRef(0);
 
-  // ✨ 퍼펙트 클리어 로직: 디더링, 템포럴, 해상도 등 화면을 크게 바꾸는 설정이 변하면 버퍼를 통째로 씻어냅니다.
   useEffect(() => {
-    isFirstFrame.current = true;
+    resetTaaFlag.current = true;
     settleCountRef.current = 0;
-  }, [texture, size, params.ditherEnabled, params.temporalEnabled]);
+  }, [params, texture, size]); 
 
   useEffect(() => {
     targetA.setSize(size.width, size.height);
@@ -778,13 +773,8 @@ const EngineCore = ({ texture, bNoise, lut3D, patternTex, params, aspect, saveRe
     if (ditherMatRef.current.uniforms.uIsExporting.value) return;
     if (params.isExportingFlag) return;
 
-    // ✨ 깨끗한 도화지로 초기화
-    if (isFirstFrame.current) {
-      gl.setRenderTarget(targetA);    gl.clearColor(); gl.clearDepth();
-      gl.setRenderTarget(targetB);    gl.clearColor(); gl.clearDepth();
-      gl.setRenderTarget(currentFbo); gl.clearColor(); gl.clearDepth();
-      isFirstFrame.current = false;
-    }
+    const justChanged = resetTaaFlag.current;
+    resetTaaFlag.current = false;
 
     const isDirty = settleCountRef.current < 45; 
 
@@ -897,7 +887,7 @@ const EngineCore = ({ texture, bNoise, lut3D, patternTex, params, aspect, saveRe
     const bm = blendMatRef.current.uniforms;
     bm.uCurrentFrame.value  = currentFbo.texture;
     bm.uPreviousFrame.value = readBuffer.texture;
-    bm.uAccumulation.value  = params.accumulation;
+    bm.uAccumulation.value  = justChanged ? 0.0 : params.accumulation;
     bm.uIsFinalOutput.value = false;
 
     gl.setRenderTarget(writeBuffer);
@@ -1084,7 +1074,7 @@ const INITIAL_PARAMS = {
   flareWidth: 0.01, flareColor: '#4488ff',
   halationThresh: 0.65,
   lutEnabled: false, lutMix: 1.0, lutDataUrl: null, lutName: null, lutSize: null,
-  animate: true,
+  animate: false, 
   temporalEnabled: true,
   glitch: 0.0, superposition: 0.0, fluidity: 0.0, melting: 0.0, halation: 0.0,
   accumulation: 0.85,
@@ -1347,13 +1337,8 @@ export default function App() {
         </label>
       </Panel>
 
+      {/* ✨ 1. DECONSTRUCT 패널 수정: 시간 종속적인 3가지 효과를 삭제했습니다. */}
       <Panel label="DECONSTRUCT" accent="#c070ff">
-        <EffectRow name="Glitch Mosh" onReset={() => sp('glitch')(0)} tag="글리치">
-          <Sl label="Glitch Mosh" min={0} max={1} value={params.glitch} onChange={sp('glitch')} accent="#c070ff" compact defaultValue={0}/>
-        </EffectRow>
-        <EffectRow name="Fluidity" onReset={() => sp('fluidity')(0)} tag="유체화">
-          <Sl label="Fluidity" min={0} max={1} value={params.fluidity} onChange={sp('fluidity')} accent="#c070ff" compact defaultValue={0}/>
-        </EffectRow>
         <EffectRow name="Melting" onReset={() => sp('melting')(0)} tag="픽셀 융해">
           <Sl label="Melting" min={0} max={1} value={params.melting} onChange={sp('melting')} accent="#c070ff" compact defaultValue={0}/>
         </EffectRow>
@@ -1362,9 +1347,6 @@ export default function App() {
 
         <EffectRow name="Crystallize" onReset={() => sp('crystallize')(0)} tag="Voronoi 셀">
           <Sl label="Crystallize" min={0} max={1} value={params.crystallize} onChange={sp('crystallize')} accent="#c070ff" compact defaultValue={0}/>
-        </EffectRow>
-        <EffectRow name="Scan Displacement" onReset={() => sp('scanDisplace')(0)} tag="스캔라인 부패">
-          <Sl label="Scan Displacement" min={0} max={1} value={params.scanDisplace} onChange={sp('scanDisplace')} accent="#c070ff" compact defaultValue={0}/>
         </EffectRow>
         <EffectRow name="Threshold Cascade" onReset={() => sp('threshCascade')(0)} tag="명도대역 분리">
           <Sl label="Threshold Cascade" min={0} max={1} value={params.threshCascade} onChange={sp('threshCascade')} accent="#c070ff" compact defaultValue={0}/>
@@ -1598,8 +1580,24 @@ export default function App() {
         )}
       </Panel>
 
+      {/* ✨ 2. TEMPORAL 패널 수정: 애니메이션 종속 효과들을 가져왔습니다. */}
       <Panel label="TEMPORAL" accent="#5a4aaa">
         <Tog label="Animate Effects" sub="끄면 화면이 스스로 안정화되며 정지" checked={params.animate} onChange={sp('animate')} />
+        
+        {params.animate && (
+          <div style={{ paddingLeft: 10, borderLeft: '2px solid #5a4aaa33', marginTop: 8, marginBottom: 8 }}>
+            <EffectRow name="Glitch Mosh" onReset={() => sp('glitch')(0)} tag="글리치">
+              <Sl label="Glitch Mosh" min={0} max={1} value={params.glitch} onChange={sp('glitch')} accent="#5a4aaa" compact defaultValue={0}/>
+            </EffectRow>
+            <EffectRow name="Fluidity" onReset={() => sp('fluidity')(0)} tag="유체화">
+              <Sl label="Fluidity" min={0} max={1} value={params.fluidity} onChange={sp('fluidity')} accent="#5a4aaa" compact defaultValue={0}/>
+            </EffectRow>
+            <EffectRow name="Scan Displacement" onReset={() => sp('scanDisplace')(0)} tag="스캔라인 부패">
+              <Sl label="Scan Displacement" min={0} max={1} value={params.scanDisplace} onChange={sp('scanDisplace')} accent="#5a4aaa" compact defaultValue={0}/>
+            </EffectRow>
+          </div>
+        )}
+
         <Sep />
         <Tog
           label="Temporal Accumulation"
