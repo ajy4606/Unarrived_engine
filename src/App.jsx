@@ -1062,7 +1062,7 @@ const TINT_NEUTRAL = { r: 0, g: 0, b: 0 };
 
 const INITIAL_PARAMS = {
   resolution: 4000,
-  ditherEnabled: true,
+  ditherEnabled: false,
   density: 30, noiseAmount: 0.0,
   contrast: 1.0, brightness: 0.0,
   shadows: 0.2, highlights: 1.0,
