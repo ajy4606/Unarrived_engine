@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import blueNoiseUrl from './assets/blue-noise.png';
 
 // ---------------------------------------------------------
-// 1. 프래그먼트 셰이더
+// 1. 프래그먼트 셰이더 (Adobe RGB 관련 수학 로직 삭제)
 // ---------------------------------------------------------
 const fragmentShader = `
   precision highp float;
@@ -68,7 +68,6 @@ const fragmentShader = `
   uniform float uHalation;
 
   uniform bool  uIsExporting;
-  uniform bool  uOutputAdobeRGB;
   uniform float uShadows;
   uniform float uHighlights;
   uniform float uACESMix;
@@ -131,14 +130,6 @@ const fragmentShader = `
 
   vec3 toneMap(vec3 lin) {
     return mix(Reinhard(lin), ACESFilm(lin), uACESMix);
-  }
-
-  vec3 sRGBtoAdobeRGB(vec3 c) {
-    return mat3(
-       0.71516,  0.00009,  0.00000,
-       0.28476,  1.00000,  0.04117,
-       0.00015, -0.00001,  0.95883
-    ) * c;
   }
 
   vec3 applySaturation(vec3 col, float sat) {
@@ -617,10 +608,8 @@ const fragmentShader = `
       final = vec3(0.0);
     }
 
-    if (uIsExporting && uOutputAdobeRGB) {
-      vec3 aRgb = sRGBtoAdobeRGB(clamp(final, 0.0, 1.0));
-      gl_FragColor = vec4(pow(max(aRgb, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
-    } else if (uIsExporting) {
+    // ✨ Adobe RGB 로직 삭제, sRGB로 단순화
+    if (uIsExporting) {
       gl_FragColor = vec4(pow(clamp(final, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
     } else {
       gl_FragColor = vec4(clamp(final, 0.0, 1.0), 1.0);
@@ -660,7 +649,7 @@ const blendFragmentShader = `
 `;
 
 // ---------------------------------------------------------
-// 2. 셰이더 머티리얼
+// 2. 셰이더 머티리얼 (Adobe RGB 관련 uniform 삭제)
 // ---------------------------------------------------------
 const DitherMaterial = shaderMaterial(
   {
@@ -682,7 +671,7 @@ const DitherMaterial = shaderMaterial(
     uHalationThreshold: 0.65,
     uEnableLUT: false, uLUTMix: 1.0,
     uGlitch: 0.0, uSuperposition: 0.0, uFluidity: 0.0, uMelting: 0.0, uHalation: 0.0,
-    uIsExporting: false, uOutputAdobeRGB: false,
+    uIsExporting: false,
     uShadows: 0.2, uHighlights: 1.0, uACESMix: 0.4, uLinearize: false,
     uColorMode: false, uSaturation: 1.0, uColorTemp: 0.0, uColorTint: 0.0,
     uShadowTint: new THREE.Vector3(0, 0, 0),
@@ -920,7 +909,6 @@ const EngineCore = ({ texture, bNoise, lut3D, patternTex, params, aspect, saveRe
             uPatternTex={patternTex}
             uAspect={aspect}
             uTexelSize={uTexelSize}
-            uOutputAdobeRGB={false}
           />
         </mesh>,
         renderScene
@@ -964,7 +952,6 @@ const Exporter = ({ saveRef, params, setIsExporting, setExportResult, texture, r
         if (u.uEffectTime)     u.uEffectTime.value     = fixedTime;
         if (u.uFrame)          u.uFrame.value          = 1;
         if (u.uIsExporting)    u.uIsExporting.value    = true;
-        if (u.uOutputAdobeRGB) u.uOutputAdobeRGB.value = p.outputAdobeRGB;
       });
 
       const tileSize    = 2048;
@@ -1008,8 +995,7 @@ const Exporter = ({ saveRef, params, setIsExporting, setExportResult, texture, r
         setExportResult({
           dataUrl,
           w: outW,
-          h: outH,
-          colorSpace: p.outputAdobeRGB ? 'Adobe RGB 1998' : 'sRGB',
+          h: outH
         });
 
       } catch (err) {
@@ -1023,8 +1009,7 @@ const Exporter = ({ saveRef, params, setIsExporting, setExportResult, texture, r
         renderScene.traverse(o => {
           const u = o.material?.uniforms;
           if (!u) return;
-          if (u.uIsExporting)    u.uIsExporting.value    = false;
-          if (u.uOutputAdobeRGB) u.uOutputAdobeRGB.value = false;
+          if (u.uIsExporting) u.uIsExporting.value = false;
         });
         setIsExporting(false);
       }
@@ -1057,7 +1042,6 @@ const INITIAL_PARAMS = {
   contrast: 1.0, brightness: 0.0,
   shadows: 0.2, highlights: 1.0,
   acesMix: 0.4, linearize: false,
-  outputAdobeRGB: false,
   colorMode: false,
   saturation: 1.0, colorTemp: 0.0, colorTint: 0.0,
   shadowTint: { ...TINT_NEUTRAL },
@@ -1332,12 +1316,12 @@ export default function App() {
     <>
       <Panel label="IMAGE">
         <label className="ua-file">
-          <input type="file" accept="image/*" onChange={handleImageUpload} style={{ display: 'none' }} />
-          ＋ 이미지 불러오기
+          {/* ✨ RAW 방지: 브라우저가 지원하는 일반 이미지 포맷만 허용되도록 명시 */}
+          <input type="file" accept="image/jpeg, image/png, image/webp" onChange={handleImageUpload} style={{ display: 'none' }} />
+          ＋ 이미지 불러오기 (JPG / PNG / WebP)
         </label>
       </Panel>
 
-      {/* ✨ 1. DECONSTRUCT 패널 수정: 시간 종속적인 3가지 효과를 삭제했습니다. */}
       <Panel label="DECONSTRUCT" accent="#c070ff">
         <EffectRow name="Melting" onReset={() => sp('melting')(0)} tag="픽셀 융해">
           <Sl label="Melting" min={0} max={1} value={params.melting} onChange={sp('melting')} accent="#c070ff" compact defaultValue={0}/>
@@ -1428,7 +1412,7 @@ export default function App() {
         </div>
         <label className="ua-file" style={{ marginBottom: 10, display: 'block',
           borderColor: params.patternEnabled ? '#e8a04088' : '#3a3a3a' }}>
-          <input type="file" accept="image/*" onChange={handlePatternUpload} style={{ display: 'none' }} />
+          <input type="file" accept="image/jpeg, image/png, image/webp" onChange={handlePatternUpload} style={{ display: 'none' }} />
           {patternTex ? '✓  패턴 로드됨 — 재업로드' : '＋  패턴 텍스처 불러오기'}
         </label>
         {patternTex && (
@@ -1553,7 +1537,8 @@ export default function App() {
         </div>
         <Sl label="Curve Mix" min={0} max={1} value={params.acesMix} onChange={sp('acesMix')}  defaultValue={0.4}/>
         <Sep />
-        <Tog label="Linear Input" sub="RAW / HDR 소스일 때만 ON" checked={params.linearize} onChange={sp('linearize')} />
+        {/* ✨ 문구 수정: RAW 오해 방지 */}
+        <Tog label="Linear Input" sub="Log / HDR 렌더링 이미지일 때만 ON" checked={params.linearize} onChange={sp('linearize')} />
       </Panel>
 
       <Panel label="EXPOSURE">
@@ -1580,7 +1565,6 @@ export default function App() {
         )}
       </Panel>
 
-      {/* ✨ 2. TEMPORAL 패널 수정: 애니메이션 종속 효과들을 가져왔습니다. */}
       <Panel label="TEMPORAL" accent="#5a4aaa">
         <Tog label="Animate Effects" sub="끄면 화면이 스스로 안정화되며 정지" checked={params.animate} onChange={sp('animate')} />
         
@@ -1751,10 +1735,9 @@ export default function App() {
               : `${Math.round(params.resolution * aspect)} × ${params.resolution} px`}
           </span>
         </div>
-        <Tog label="Adobe RGB 1998 출력" sub={params.outputAdobeRGB ? 'Photoshop / Lightroom 색역 보존' : 'sRGB — 웹·SNS 표준'}
-          checked={params.outputAdobeRGB} onChange={sp('outputAdobeRGB')} />
       </Panel>
 
+      {/* ✨ 추출 버튼 텍스트에서 혼동을 줄 수 있는 RAW 단어 삭제 */}
       <button
         onClick={() => !params.isExportingFlag && saveRef.current?.()}
         style={{
@@ -1768,7 +1751,7 @@ export default function App() {
           fontSize: 12, letterSpacing: '0.06em', transition: 'opacity .15s',
         }}
       >
-        {params.isExportingFlag ? '⏳  추출 중…' : '↓  EXTRACT RAW MOMENT'}
+        {params.isExportingFlag ? '⏳  추출 중…' : '↓  EXTRACT HIGH-RES MOMENT'}
       </button>
       <div style={{ height: 20 }} />
     </>
@@ -2038,12 +2021,6 @@ export default function App() {
                 <div style={{ fontSize: 13, fontWeight: '700', color: '#e8e8e8' }}>
                   추출 완료 — {exportResult.w} × {exportResult.h} px
                 </div>
-                <div style={{ fontSize: 11, marginTop: 3,
-                  color: exportResult.colorSpace === 'Adobe RGB 1998' ? '#4a90d9' : '#7a7a7a' }}>
-                  {exportResult.colorSpace}
-                  {exportResult.colorSpace === 'Adobe RGB 1998' &&
-                    <span style={{ color: '#5a6a7a', marginLeft: 6 }}>— Photoshop에서 색공간 지정 후 열기</span>}
-                </div>
               </div>
               <button onClick={() => setExportResult(null)}
                 style={{ background: '#333', border: '1px solid #444', color: '#aaa',
@@ -2058,7 +2035,7 @@ export default function App() {
                 borderRadius: 4, border: '1px solid #2d2d2d', background: '#111' }} />
 
             <a href={exportResult.dataUrl}
-              download={`The_Unarrived_${exportResult.w}x${exportResult.h}_${exportResult.colorSpace === 'Adobe RGB 1998' ? 'AdobeRGB' : 'sRGB'}.png`}
+              download={`The_Unarrived_${exportResult.w}x${exportResult.h}.png`}
               style={{
                 display: 'block', padding: '11px 0', textAlign: 'center',
                 background: 'linear-gradient(180deg,#4a90d9,#2d6db0)',
