@@ -61,6 +61,24 @@ const fragmentShader = `
   uniform float uFlareWidth;
   uniform vec3  uFlareColor;
   uniform float uHalationThreshold;
+  uniform float uHalationRadius;
+  uniform float uHalationSoftness;
+  uniform vec3  uHalationColor;
+
+  uniform float uMistAmount;
+  uniform float uMistRadius;
+  uniform float uMistThreshold;
+  uniform vec3  uMistTint;
+
+  uniform float uPixelate;
+  uniform float uPixelScale;
+  uniform float uPixelJitter;
+  uniform float uPixelGrid;
+
+  uniform float uDepth3D;
+  uniform float uDepthAngle;
+  uniform float uDepthChroma;
+  uniform float uDepthLight;
 
   uniform bool  uEnableLUT;
   uniform float uLUTMix;
@@ -261,6 +279,23 @@ const fragmentShader = `
       patternMaskValue = mix(1.0, patternSample(patternUv(modUv, uPatternScale, uPatternAngle)), uPatternIntensity);
     }
 
+    // Pixel Matrix: 화면 비율을 보정한 정사각형 셀 + 셀 단위 미세 흔들림
+    if (uPixelate > 0.0) {
+      float cellsY = max(uPixelScale, 2.0);
+      vec2 grid = vec2(cellsY * uAspect, cellsY);
+      vec2 cellId = floor(modUv * grid);
+      vec2 jitter = (hash2(cellId + floor(uEffectTime * 6.0)) - 0.5) * uPixelJitter;
+      vec2 pixelUv = (cellId + 0.5 + jitter) / grid;
+      modUv = mix(modUv, clamp(pixelUv, 0.001, 0.999), uPixelate);
+    }
+
+    // Luma Depth: 밝기 맵을 깊이로 사용해 시점 방향으로 패럴랙스 이동
+    if (uDepth3D > 0.0) {
+      float depthLuma = dot(texture(uTexture, modUv).rgb, vec3(0.2126, 0.7152, 0.0722));
+      vec2 depthDir = vec2(cos(uDepthAngle) / max(uAspect, 0.001), sin(uDepthAngle));
+      modUv = clamp(modUv + depthDir * (depthLuma - 0.5) * uDepth3D * 0.12, 0.001, 0.999);
+    }
+
     if (uMelting > 0.0) {
       float safeTexel  = max(uTexelSize.x, 0.0001);
       float actualGrid = mix(1.0 / safeTexel, mix(1000.0, 10.0, uMelting), (1.0 - preLuma) * uMelting);
@@ -320,6 +355,23 @@ const fragmentShader = `
       rawRgb = texture(uTexture, modUv).rgb;
     }
 
+    if (uDepth3D > 0.0) {
+      vec2 lightDir = vec2(cos(uDepthAngle), sin(uDepthAngle));
+      vec2 chromaStep = lightDir * uDepthChroma * 0.012;
+      vec3 depthRgb = rawRgb;
+      depthRgb.r = texture(uTexture, clamp(modUv + chromaStep, 0.001, 0.999)).r;
+      depthRgb.b = texture(uTexture, clamp(modUv - chromaStep, 0.001, 0.999)).b;
+
+      float lL = dot(texture(uTexture, modUv - vec2(uTexelSize.x * 3.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+      float lR = dot(texture(uTexture, modUv + vec2(uTexelSize.x * 3.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+      float lD = dot(texture(uTexture, modUv - vec2(0.0, uTexelSize.y * 3.0)).rgb, vec3(0.2126,0.7152,0.0722));
+      float lU = dot(texture(uTexture, modUv + vec2(0.0, uTexelSize.y * 3.0)).rgb, vec3(0.2126,0.7152,0.0722));
+      vec3 normal = normalize(vec3((lL-lR) * 6.0, (lD-lU) * 6.0, 1.0));
+      vec3 lamp = normalize(vec3(lightDir, 0.8));
+      float relief = mix(1.0, 0.72 + max(dot(normal, lamp), 0.0) * 0.48, uDepthLight);
+      rawRgb = mix(rawRgb, depthRgb * relief, uDepth3D);
+    }
+
     if (uEnableSharpen) {
       vec3 c = rawRgb * 5.0
              - texture(uTexture, modUv + vec2(-uTexelSize.x, 0.0)).rgb
@@ -363,16 +415,39 @@ const fragmentShader = `
                                   -p00-2.0*p10-p20+p02+2.0*p12+p22)) * 2.8, 0.0, 1.0);
     }
 
-    // ── 3. 할레이션 / 플레어 ─────────────────────────────────────────────
+    // ── 3. 필름 확산 / 할레이션 / 플레어 ────────────────────────────────
+    vec3 mistGlow = vec3(0.0);
+    if (uMistAmount > 0.0) {
+      vec2 mistOffsets[8] = vec2[](
+        vec2(1,0),vec2(-1,0),vec2(0,1),vec2(0,-1),
+        vec2(.707,.707),vec2(-.707,.707),vec2(.707,-.707),vec2(-.707,-.707)
+      );
+      vec3 softField = vec3(0.0);
+      for (int i = 0; i < 8; i++) {
+        vec3 s = texture(uTexture, clamp(modUv + mistOffsets[i] * uTexelSize * uMistRadius, 0.001, 0.999)).rgb;
+        float gate = smoothstep(uMistThreshold, min(1.0, uMistThreshold + 0.28), dot(s, vec3(0.2126,0.7152,0.0722)));
+        softField += s * (0.18 + gate * 0.82);
+      }
+      softField /= 8.0;
+      mistGlow = softField * uMistTint;
+      vec3 screenMist = 1.0 - (1.0 - rawRgb) * (1.0 - clamp(mistGlow, 0.0, 1.0));
+      rawRgb = mix(rawRgb, screenMist, uMistAmount * 0.72);
+      rawRgb = mix(rawRgb, softField, uMistAmount * 0.18);
+    }
+
     vec3 halation = vec3(0.0);
     if (uHalation > 0.0) {
-      vec2 offsets[4] = vec2[](vec2(1,0),vec2(-1,0),vec2(0,1),vec2(0,-1));
-      halation += smoothstep(uHalationThreshold, 1.0, dot(rawRgb, vec3(0.2126,0.7152,0.0722))) * vec3(1.0,0.1,0.0);
-      for (int i = 0; i < 4; i++) {
-        vec3 s = texture(uTexture, modUv + offsets[i] * uTexelSize * 5.0).rgb;
-        halation += smoothstep(uHalationThreshold, 1.0, dot(s, vec3(0.2126,0.7152,0.0722))) * vec3(1.0,0.1,0.0);
+      vec2 haloOffsets[8] = vec2[](
+        vec2(1,0),vec2(-1,0),vec2(0,1),vec2(0,-1),
+        vec2(.707,.707),vec2(-.707,.707),vec2(.707,-.707),vec2(-.707,-.707)
+      );
+      float haloEnd = min(1.0, uHalationThreshold + max(uHalationSoftness, 0.02));
+      for (int i = 0; i < 8; i++) {
+        vec3 s = texture(uTexture, clamp(modUv + haloOffsets[i] * uTexelSize * uHalationRadius, 0.001, 0.999)).rgb;
+        float haloMask = smoothstep(uHalationThreshold, haloEnd, dot(s, vec3(0.2126,0.7152,0.0722)));
+        halation += haloMask * uHalationColor;
       }
-      halation /= 5.0;
+      halation /= 8.0;
     }
 
     vec3 flare = vec3(0.0);
@@ -595,6 +670,14 @@ const fragmentShader = `
       final = mix(final, clamp(soft, 0.0, 1.0), uPatternIntensity);
     }
 
+    if (uPixelate > 0.0 && uPixelGrid > 0.0) {
+      vec2 grid = vec2(max(uPixelScale, 2.0) * uAspect, max(uPixelScale, 2.0));
+      vec2 cell = fract(vUv * grid);
+      float edgeDistance = min(min(cell.x, 1.0-cell.x), min(cell.y, 1.0-cell.y));
+      float seam = 1.0 - smoothstep(0.0, 0.08 * uPixelGrid, edgeDistance);
+      final *= 1.0 - seam * uPixelGrid * uPixelate * 0.42;
+    }
+
     // ── 12. 출력 ──────────────────────────────────────────────────────────
     // 이중 감마 없음: 입력 sRGB → 처리 → sRGB 출력 그대로
     // uLinearize=true 경우 입력에서 pow(2.2)로 선형화했으므로
@@ -656,7 +739,12 @@ const DitherMaterial = shaderMaterial(
     uEnableGrain: true, uGrainAmount: 0.03, uGrainSize: 2.0,
     uEnableAnamorphic: false, uFlareThreshold: 0.9, uFlareAmount: 0.5,
     uFlareWidth: 0.01, uFlareColor: new THREE.Color('#4488ff'),
-    uHalationThreshold: 0.65,
+    uHalationThreshold: 0.65, uHalationRadius: 9.0, uHalationSoftness: 0.18,
+    uHalationColor: new THREE.Color('#ff4d1f'),
+    uMistAmount: 0.0, uMistRadius: 12.0, uMistThreshold: 0.55,
+    uMistTint: new THREE.Color('#fff2dc'),
+    uPixelate: 0.0, uPixelScale: 48.0, uPixelJitter: 0.0, uPixelGrid: 0.0,
+    uDepth3D: 0.0, uDepthAngle: 0.55, uDepthChroma: 0.25, uDepthLight: 0.65,
     uEnableLUT: false, uLUTMix: 1.0,
     uGlitch: 0.0, uSuperposition: 0.0, uFluidity: 0.0, uMelting: 0.0, uHalation: 0.0,
     uIsExporting: false,
@@ -799,6 +887,21 @@ const EngineCore = ({ texture, bNoise, lut3D, patternTex, curveTex, params, aspe
     dm.uFlareWidth.value        = params.flareWidth;
     dm.uFlareColor.value.set(params.flareColor);
     dm.uHalationThreshold.value = params.halationThresh;
+    dm.uHalationRadius.value    = params.halationRadius;
+    dm.uHalationSoftness.value  = params.halationSoftness;
+    dm.uHalationColor.value.set(params.halationColor);
+    dm.uMistAmount.value        = params.mistAmount;
+    dm.uMistRadius.value        = params.mistRadius;
+    dm.uMistThreshold.value     = params.mistThreshold;
+    dm.uMistTint.value.set(params.mistTint);
+    dm.uPixelate.value          = params.pixelate;
+    dm.uPixelScale.value        = params.pixelScale;
+    dm.uPixelJitter.value       = params.pixelJitter;
+    dm.uPixelGrid.value         = params.pixelGrid;
+    dm.uDepth3D.value           = params.depth3D;
+    dm.uDepthAngle.value        = params.depthAngle;
+    dm.uDepthChroma.value       = params.depthChroma;
+    dm.uDepthLight.value        = params.depthLight;
     dm.uEnableLUT.value         = params.lutEnabled;
     dm.uLUTMix.value            = params.lutMix;
     dm.uCrystallize.value       = params.crystallize;
@@ -981,10 +1084,13 @@ const INITIAL_PARAMS = {
   vignette: false, vignetteStrength: 0.5,
   lift: { r: 0, g: 0, b: 0 }, gamma: 1.0, gain: { r: 1, g: 1, b: 1 },
   caEnable: false, caAmount: 0.015, caType: 0,
-  grain: 0.03, grainSize: 2.0,
+  grain: 0.0, grainSize: 2.0,
   flare: false, flareThresh: 0.9, flareAmount: 0.5,
   flareWidth: 0.01, flareColor: '#4488ff',
-  halationThresh: 0.65,
+  halationThresh: 0.65, halationRadius: 9.0, halationSoftness: 0.18, halationColor: '#ff4d1f',
+  mistAmount: 0.0, mistRadius: 12.0, mistThreshold: 0.55, mistTint: '#fff2dc',
+  pixelate: 0.0, pixelScale: 48.0, pixelJitter: 0.0, pixelGrid: 0.0,
+  depth3D: 0.0, depthAngle: 0.55, depthChroma: 0.25, depthLight: 0.65,
   lutEnabled: false, lutMix: 1.0, lutDataUrl: null, lutName: null, lutSize: null,
   animate: false, temporalEnabled: true,
   glitch: 0.0, superposition: 0.0, fluidity: 0.0, melting: 0.0, halation: 0.0,
@@ -1007,6 +1113,66 @@ const INITIAL_PARAMS = {
   isExportingFlag: false,
 };
 
+const QUICK_LOOKS = [
+  {
+    id: 'clean', name: 'Clean Frame', tag: 'SOURCE',
+    swatch: 'linear-gradient(135deg,#dbe5e8 0%,#65747b 48%,#15191b 100%)',
+    patch: { colorMode:true, grain:0, contrast:1, brightness:0, saturation:1 },
+  },
+  {
+    id: 'bloom', name: 'Dream Mist', tag: 'ANALOG',
+    swatch: 'linear-gradient(135deg,#ff5e7e 0%,#8f4cff 50%,#111827 100%)',
+    patch: { colorMode:true, mistAmount:0.58, mistRadius:18, mistThreshold:0.46,
+      halation:0.26, halationThresh:0.62, halationRadius:12, grain:0.038,
+      saturation:1.08, contrast:0.96, highlights:-0.12 },
+  },
+  {
+    id: 'liquid', name: 'Depth Chrome', tag: 'DIMENSION',
+    swatch: 'linear-gradient(135deg,#86fff2 0%,#5463ff 45%,#ff68c9 100%)',
+    patch: { colorMode:true, depth3D:0.66, depthAngle:0.58, depthChroma:0.62, depthLight:0.78,
+      crystallize:0.06, saturation:1.16, contrast:1.12, caEnable:true, caAmount:0.009 },
+  },
+  {
+    id: 'acid', name: 'Acid Blocks', tag: 'PIXEL',
+    swatch: 'linear-gradient(135deg,#eaff45 0%,#ff8a00 47%,#ff2f87 100%)',
+    patch: { colorMode:true, pixelate:0.82, pixelScale:54, pixelJitter:0.08, pixelGrid:0.22,
+      ditherEnabled:true, levels:6, softness:0.18, noiseAmount:0.04,
+      halftone:0.1, halftoneScale:54, contrast:1.18, saturation:1.3 },
+  },
+  {
+    id: 'noir', name: 'Noir Raster', tag: 'MONO',
+    swatch: 'linear-gradient(135deg,#f2f1e8 0%,#6a6b68 44%,#080909 100%)',
+    patch: { colorMode:false, pixelate:0.3, pixelScale:92, pixelGrid:0.12,
+      ditherEnabled:true, levels:4, softness:0.08, noiseAmount:0.025,
+      stipple:0.2, grain:0.075, contrast:1.28, brightness:-0.025, halation:0.06 },
+  },
+  {
+    id: 'prism', name: 'Prism Leak', tag: 'OPTICS',
+    swatch: 'linear-gradient(135deg,#2b0b54 0%,#ff3e9d 38%,#42e8ff 72%,#fcff9b 100%)',
+    patch: { colorMode:true, caEnable:true, caAmount:0.032, depth3D:0.22, depthChroma:0.78,
+      flare:true, flareAmount:0.72, flareWidth:0.022, halation:0.32, halationRadius:15,
+      mistAmount:0.16, saturation:1.18, grain:0.04 },
+  },
+];
+
+const WORKSPACES = [
+  { id:'source', label:'Source', icon:'＋' },
+  { id:'pixel', label:'Pixel', icon:'▦' },
+  { id:'analog', label:'Analog', icon:'◉' },
+  { id:'dimension', label:'3D', icon:'◈' },
+  { id:'color',  label:'Color',  icon:'◐' },
+  { id:'output', label:'Output', icon:'↗' },
+];
+
+const PANEL_GROUPS = {
+  IMAGE:'source', 'PIXEL MATRIX':'pixel', DECONSTRUCT:'pixel', RECONSTRUCT:'pixel', 'TEXTURE STAMP':'pixel',
+  ATMOSPHERE:'analog', 'OPTICS & FILM':'analog',
+  'DEPTH STAGE':'dimension', TEMPORAL:'dimension',
+  MODE:'color', 'WHITE BALANCE':'color', 'COLOR GRADING':'color', 'ASC CDL':'color',
+  'DITHER COLORS':'color', 'TONE CURVE':'color', 'TONE MAPPING':'color',
+  EXPOSURE:'color', DITHERING:'color', 'LUT & PRESETS':'color', EXPORT:'output',
+};
+
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
   const [params,       setParams]       = useState({ ...INITIAL_PARAMS });
@@ -1014,9 +1180,12 @@ export default function App() {
   const [bNoise,       setBNoise]       = useState(null);
   const [lut3D,        setLut3D]        = useState(null);
   const [patternTex,   setPatternTex]   = useState(null);
-  const [presets,      setPresets]      = useState([]);
+  const [presets,      setPresets]      = useState(() => {
+    try { return JSON.parse(localStorage.getItem(PRESETS_KEY) || '[]'); }
+    catch { return []; }
+  });
   const [presetName,   setPresetName]   = useState('');
-  const [webgl2,       setWebgl2]       = useState(true);
+  const [webgl2]       = useState(() => Boolean(document.createElement('canvas').getContext('webgl2')));
   const [exportResult, setExportResult] = useState(null);
   const [sidebarOpen,  setSidebarOpen]  = useState(false);
   const [isMobile,     setIsMobile]     = useState(() => window.innerWidth < 768);
@@ -1024,6 +1193,11 @@ export default function App() {
   const [pan,          setPan]          = useState({ x: 0, y: 0 });
   const [zoomVisible,  setZoomVisible]  = useState(false);
   const [isPanningState, setIsPanningState] = useState(false);
+  const [activeWorkspace, setActiveWorkspace] = useState('pixel');
+  const [compareOriginal, setCompareOriginal] = useState(false);
+  const [activeLook, setActiveLook] = useState('clean');
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [dockOpen, setDockOpen] = useState(true);
 
   const isPanning          = useRef(false);
   const panStart           = useRef({ x: 0, y: 0, px: 0, py: 0 });
@@ -1034,6 +1208,21 @@ export default function App() {
   const patternRef         = useRef();
   const curveTexRef        = useRef(null);
   const [curveTex, setCurveTex] = useState(null);
+
+  const activeEffectCount = useMemo(() => {
+    const amounts = [params.melting, params.crystallize, params.threshCascade, params.sortGlitch,
+      params.freqPeel, params.edgeHarvest, params.inkSpread, params.stipple, params.scatter,
+      params.halftone, params.crossHatch, params.glitch, params.superposition, params.fluidity,
+      params.halation, params.mistAmount, params.pixelate, params.depth3D, params.grain,
+      params.vignetteStrength * Number(params.vignette),
+      params.sharpenAmount * Number(params.sharpen), params.caAmount * Number(params.caEnable),
+      params.flareAmount * Number(params.flare), params.lutMix * Number(params.lutEnabled)];
+    return amounts.filter(v => Number(v) > 0.01).length + Number(params.ditherEnabled) + Number(params.curveEnabled);
+  }, [params]);
+
+  const previewParams = useMemo(() => compareOriginal
+    ? { ...INITIAL_PARAMS, grain:0, temporalEnabled:false, isExportingFlag:params.isExportingFlag }
+    : params, [compareOriginal, params]);
 
   // clampPan: 줌 레벨에 따른 팬 범위 제한
   // 시뮬레이션: zoom=1 → {x:0,y:0} 반환 ✓
@@ -1132,6 +1321,8 @@ export default function App() {
   // curves 변경 시 텍스처 재빌드
   useEffect(() => {
     const tex = buildCurveTex(params.curves);
+    // Three.js 텍스처 객체를 React 렌더 사이클 밖에서 갱신한 뒤 참조만 교체한다.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCurveTex(tex);
   }, [params.curves, buildCurveTex]);
 
@@ -1139,6 +1330,20 @@ export default function App() {
     const onResize = () => setIsMobile(window.innerWidth < 768);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.code === 'Space') { e.preventDefault(); setCompareOriginal(e.type === 'keydown'); }
+      if (e.type === 'keydown' && ['Digit1','Digit2','Digit4'].includes(e.code)) {
+        const next = Number(e.code.slice(-1)); setZoom(next);
+        if (next === 1) setPan({ x:0, y:0 });
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); };
   }, []);
 
   useEffect(() => {
@@ -1154,9 +1359,6 @@ export default function App() {
       'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop',
       setTexture
     );
-    const saved = localStorage.getItem(PRESETS_KEY);
-    if (saved) { try { setPresets(JSON.parse(saved)); } catch {} }
-    if (!document.createElement('canvas').getContext('webgl2')) setWebgl2(false);
   }, []);
 
   const defaultLut3D = useMemo(() => {
@@ -1166,13 +1368,44 @@ export default function App() {
     return t;
   }, []);
 
-  const handleImageUpload = useCallback((e) => {
-    const file = e.target.files[0]; if (!file) return;
+  const loadImageFile = useCallback((file) => {
+    if (!file || !file.type?.startsWith('image/')) return;
     const url = URL.createObjectURL(file);
     new THREE.TextureLoader().load(url, (tex) => {
       setTexture(prev => { prev?.dispose(); return tex; });
       URL.revokeObjectURL(url);
     });
+  }, []);
+
+  const handleImageUpload = useCallback((e) => {
+    loadImageFile(e.target.files[0]);
+    e.target.value = '';
+  }, [loadImageFile]);
+
+  const handleCanvasDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    loadImageFile(e.dataTransfer.files?.[0]);
+  }, [loadImageFile]);
+
+  const applyQuickLook = useCallback((look) => {
+    setActiveLook(look.id);
+    setParams(p => ({
+      ...INITIAL_PARAMS,
+      resolution: p.resolution,
+      isExportingFlag: p.isExportingFlag,
+      ...look.patch,
+    }));
+  }, []);
+
+  const mutateLook = useCallback(() => {
+    const pick = QUICK_LOOKS[Math.floor(Math.random() * (QUICK_LOOKS.length - 1)) + 1];
+    setActiveLook(pick.id);
+    setParams(p => ({ ...INITIAL_PARAMS, resolution:p.resolution, isExportingFlag:p.isExportingFlag, ...pick.patch,
+      contrast: Math.max(0.75, Math.min(1.55, (pick.patch.contrast ?? p.contrast) + (Math.random() - 0.5) * 0.16)),
+      grain: Math.max(0, Math.min(0.16, (pick.patch.grain ?? p.grain) + Math.random() * 0.025)),
+      saturation: Math.max(0.55, Math.min(1.55, (pick.patch.saturation ?? p.saturation) + (Math.random() - 0.5) * 0.18)),
+    }));
   }, []);
 
   const parseCubeLUT = useCallback((text) => {
@@ -1320,6 +1553,16 @@ export default function App() {
           <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleImageUpload} style={{ display: 'none' }} />
           ＋ 이미지 불러오기 (JPG / PNG / WebP)
         </label>
+      </Panel>
+
+      <Panel label="PIXEL MATRIX" accent="#d9ff52">
+        <div className="ua-theme-note"><b>BLOCK ENGINE</b><span>정사각 픽셀 셀로 이미지를 재해석합니다.</span></div>
+        <Sl label="Pixel Amount" min={0} max={1} value={params.pixelate} onChange={sp('pixelate')} accent="#d9ff52" defaultValue={0}/>
+        {params.pixelate > 0 && (<>
+          <Sl label="Cell Density" sub="낮을수록 픽셀이 크게 보입니다" min={8} max={180} step={1} value={params.pixelScale} onChange={sp('pixelScale')} accent="#d9ff52" defaultValue={48}/>
+          <Sl label="Cell Jitter" sub="Animate Effects와 함께 사용하면 살아 움직입니다" min={0} max={0.9} value={params.pixelJitter} onChange={sp('pixelJitter')} accent="#d9ff52" defaultValue={0}/>
+          <Sl label="Grid Seam" min={0} max={1} value={params.pixelGrid} onChange={sp('pixelGrid')} accent="#d9ff52" defaultValue={0}/>
+        </>)}
       </Panel>
 
       <Panel label="DECONSTRUCT" accent="#c070ff">
@@ -1559,6 +1802,23 @@ export default function App() {
         )}
       </Panel>
 
+      <Panel label="DEPTH STAGE" accent="#50e6ff">
+        <div className="ua-theme-note"><b>LUMA → Z DEPTH</b><span>밝기를 높이맵으로 바꿔 패럴랙스와 입체 조명을 만듭니다.</span></div>
+        <div className="ua-mini-presets">
+          <button onClick={() => setParams(p => ({...p, depth3D:0.52, depthAngle:0.55, depthChroma:0.08, depthLight:0.9}))}>RELIEF</button>
+          <button onClick={() => setParams(p => ({...p, depth3D:0.62, depthAngle:0.72, depthChroma:0.72, depthLight:0.55}))}>HOLO</button>
+          <button onClick={() => setParams(p => ({...p, depth3D:0.8, depthAngle:2.4, depthChroma:0.25, depthLight:0.75}))}>INVERT Z</button>
+        </div>
+        <Sl label="Depth Amount" min={0} max={1} value={params.depth3D} onChange={sp('depth3D')} accent="#50e6ff" defaultValue={0}/>
+        {params.depth3D > 0 && (<>
+          <Sl label="View Angle °" min={0} max={360} step={1}
+            value={Math.round(params.depthAngle*(180/Math.PI))}
+            onChange={v => sp('depthAngle')(v*(Math.PI/180))} accent="#50e6ff" defaultValue={32}/>
+          <Sl label="Spectral Depth" min={0} max={1} value={params.depthChroma} onChange={sp('depthChroma')} accent="#50e6ff" defaultValue={0.25}/>
+          <Sl label="Relief Light" min={0} max={1} value={params.depthLight} onChange={sp('depthLight')} accent="#50e6ff" defaultValue={0.65}/>
+        </>)}
+      </Panel>
+
       <Panel label="TEMPORAL" accent="#5a4aaa">
         <Tog label="Animate Effects" sub="끄면 화면이 스스로 안정화되며 정지" checked={params.animate} onChange={sp('animate')}/>
         {params.animate && (
@@ -1581,6 +1841,32 @@ export default function App() {
         {params.temporalEnabled && (
           <Sl label="Accum. Strength" min={0} max={0.99} step={0.01} value={params.accumulation} onChange={sp('accumulation')} defaultValue={0.85}
             sub="과거 프레임 보존율 (높을수록 부드럽지만 잔상 증가)"/>
+        )}
+      </Panel>
+
+      <Panel label="ATMOSPHERE" accent="#ff8d68">
+        <div className="ua-theme-note"><b>OPTICAL DIFFUSION</b><span>디지털 선명도를 낮추고 빛 주변에 공기와 필름 번짐을 더합니다.</span></div>
+        <EffectRow name="Mist Diffusion" onReset={() => sp('mistAmount')(0)} tag="Black Pro-Mist">
+          <Sl label="Mist Amount" min={0} max={1} value={params.mistAmount} onChange={sp('mistAmount')} accent="#ffb58f" compact defaultValue={0}/>
+        </EffectRow>
+        {params.mistAmount > 0 && (
+          <div className="ua-sub-controls">
+            <Sl label="Diffusion Radius" min={2} max={32} step={1} value={params.mistRadius} onChange={sp('mistRadius')} accent="#ffb58f" defaultValue={12}/>
+            <Sl label="Highlight Gate" min={0.1} max={0.9} value={params.mistThreshold} onChange={sp('mistThreshold')} accent="#ffb58f" defaultValue={0.55}/>
+            <TintSwatch label="Mist Tint" value={params.mistTint} onChange={e => sp('mistTint')(e.target.value)} onReset={() => sp('mistTint')('#fff2dc')}/>
+          </div>
+        )}
+        <Sep/>
+        <EffectRow name="Film Halation" onReset={() => sp('halation')(0)} tag="Emulsion halo">
+          <Sl label="Halation" min={0} max={1} value={params.halation} onChange={sp('halation')} accent="#ff5f3d" compact defaultValue={0}/>
+        </EffectRow>
+        {params.halation > 0 && (
+          <div className="ua-sub-controls">
+            <Sl label="Halo Radius" min={2} max={30} step={1} value={params.halationRadius} onChange={sp('halationRadius')} accent="#ff5f3d" defaultValue={9}/>
+            <Sl label="Highlight Threshold" min={0.25} max={0.95} value={params.halationThresh} onChange={sp('halationThresh')} accent="#ff5f3d" defaultValue={0.65}/>
+            <Sl label="Edge Softness" min={0.03} max={0.45} value={params.halationSoftness} onChange={sp('halationSoftness')} accent="#ff5f3d" defaultValue={0.18}/>
+            <TintSwatch label="Halo Color" value={params.halationColor} onChange={e => sp('halationColor')(e.target.value)} onReset={() => sp('halationColor')('#ff4d1f')}/>
+          </div>
         )}
       </Panel>
 
@@ -1613,9 +1899,7 @@ export default function App() {
           <Sl label="CA Amount" min={0} max={0.06} value={params.caAmount} onChange={sp('caAmount')} defaultValue={0.015}/>
         </>)}
         <Sep/>
-        <Sl label="Film Halation" min={0} max={1.0} value={params.halation} onChange={sp('halation')} defaultValue={0.0}/>
-        {params.halation > 0 && <Sl label="Halation Thresh" min={0.3} max={0.95} value={params.halationThresh} onChange={sp('halationThresh')} defaultValue={0.65}/>}
-        <Sl label="Film Grain" min={0} max={0.3} value={params.grain}     onChange={sp('grain')}     defaultValue={0.03}/>
+        <Sl label="Film Grain" min={0} max={0.3} value={params.grain}     onChange={sp('grain')}     defaultValue={0}/>
         <Sl label="Grain Size" min={1} max={8}   value={params.grainSize} onChange={sp('grainSize')} defaultValue={2.0}/>
       </Panel>
 
@@ -1659,7 +1943,7 @@ export default function App() {
                 setParams(prev => ({ ...prev, ...p.params }));
                 if (p.params.lutDataUrl) {
                   const i = new Image();
-                  i.onload = () => { try { const {tex3d} = create3DFromImg(i); if (lutRef.current) lutRef.current.dispose(); lutRef.current = tex3d; setLut3D(tex3d); } catch {} };
+                  i.onload = () => { try { const {tex3d} = create3DFromImg(i); if (lutRef.current) lutRef.current.dispose(); lutRef.current = tex3d; setLut3D(tex3d); } catch { /* 손상된 LUT 프리셋은 건너뜀 */ } };
                   i.src = p.params.lutDataUrl;
                 } else if (p.params.lutEnabled) { setLut3D(null); setParams(prev => ({ ...prev, ...p.params, lutEnabled:false })); }
               }} style={{ fontSize:12, color:'#b8b8b8', fontWeight:'500', flex:1 }}>{p.name}</span>
@@ -1680,90 +1964,74 @@ export default function App() {
         </div>
       </Panel>
 
-      <button onClick={() => !params.isExportingFlag && saveRef.current?.()}
-        style={{
-          width:'100%', padding:'13px 0', marginTop:4,
-          background: params.isExportingFlag ? '#252525' : 'linear-gradient(180deg,#4a90d9 0%,#2d6db0 100%)',
-          color: params.isExportingFlag ? '#555' : '#fff',
-          border: params.isExportingFlag ? '1px solid #333' : '1px solid #5aa0e9',
-          borderRadius:5, fontWeight:'600', cursor: params.isExportingFlag ? 'not-allowed' : 'pointer',
-          fontSize:12, letterSpacing:'0.06em', transition:'opacity .15s',
-        }}>
-        {params.isExportingFlag ? '⏳  추출 중…' : '↓  EXTRACT HIGH-RES MOMENT'}
-      </button>
-      <div style={{ height:20 }}/>
+      <div className="ua-legacy-export-action">
+        <button onClick={() => !params.isExportingFlag && saveRef.current?.()}
+          style={{
+            width:'100%', padding:'13px 0', marginTop:4,
+            background: params.isExportingFlag ? '#252525' : C.accent,
+            color: params.isExportingFlag ? '#555' : '#111',
+            border: params.isExportingFlag ? '1px solid #333' : `1px solid ${C.accentHi}`,
+            borderRadius:7, fontWeight:'800', cursor: params.isExportingFlag ? 'not-allowed' : 'pointer',
+            fontSize:11, letterSpacing:'0.08em', transition:'opacity .15s',
+          }}>
+          {params.isExportingFlag ? 'RENDERING…' : 'EXPORT HIGH-RES PNG  ↗'}
+        </button>
+        <div style={{ height:20 }}/>
+      </div>
     </>
   ), [params, presets, presetName, patternTex, webgl2, aspect, sp,
       handleImageUpload, handlePatternUpload, handleLUTUpload, create3DFromImg,
       setParams, setPresets, setPresetName, setLut3D, saveRef, lutRef]);
 
   return (
-    <div style={{ width:'100vw', height:'100dvh', display:'flex', background:'#141414', color:'#c8c8c8',
-      fontFamily:"'Segoe UI', system-ui, -apple-system, sans-serif", position:'relative', overflow:'hidden' }}>
-
-      {isMobile && (
-        <button onClick={() => setSidebarOpen(o => !o)}
-          style={{ position:'absolute', top:12, left:12, zIndex:200, width:36, height:36,
-            background:'#2d2d2d', border:'1px solid #3d3d3d', borderRadius:5, cursor:'pointer',
-            display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:4 }}
-          aria-label="메뉴">
-          {[0,1,2].map(i => (
-            <span key={i} style={{
-              display:'block', width:16, height:1.5, background:'#c8c8c8',
-              transition:'transform 0.2s, opacity 0.2s',
-              transform: sidebarOpen ? (i===0 ? 'rotate(45deg) translate(4px,4px)' : i===2 ? 'rotate(-45deg) translate(4px,-4px)' : 'scaleX(0)') : 'none',
-              opacity: sidebarOpen && i===1 ? 0 : 1,
-            }}/>
-          ))}
-        </button>
-      )}
-
-      {/* 사이드바 */}
-      <div className="ua-panel" style={{
-        width:272, flexShrink:0, background:'#1e1e1e', borderRight:'1px solid #2d2d2d',
-        zIndex:100, display:'flex', flexDirection:'column',
-        ...(isMobile ? {
-          position:'absolute', top:0, left:0, bottom:0, width:'82vw', maxWidth:300,
-          transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)',
-          transition:'transform 0.22s cubic-bezier(.4,0,.2,1)',
-          boxShadow: sidebarOpen ? '6px 0 32px rgba(0,0,0,0.6)' : 'none',
-        } : {}),
-      }}>
-        <div style={{ padding:'14px 14px 12px', borderBottom:'1px solid #2d2d2d', marginLeft: isMobile ? 44 : 0 }}>
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-            <div style={{ fontSize:13, fontWeight:'700', color:'#e0e0e0', letterSpacing:'-0.3px' }}>
-              The Unarrived Engine
-            </div>
-            <button
-              onClick={() => { if (window.confirm('모든 설정을 초기 상태로 되돌리시겠습니까?')) setParams({ ...INITIAL_PARAMS }); }}
-              style={{ fontSize:10, fontWeight:'600', letterSpacing:'0.04em', background:'none', border:'1px solid #3a3a3a', color:'#6a8aaa', borderRadius:4, padding:'3px 8px', cursor:'pointer', transition:'border-color 0.15s, color 0.15s' }}
-              onMouseEnter={e => { e.target.style.borderColor='#5a7a9a'; e.target.style.color='#8aaabb'; }}
-              onMouseLeave={e => { e.target.style.borderColor='#3a3a3a'; e.target.style.color='#6a8aaa'; }}>
-              RESET ALL
+    <div className="ua-app-shell">
+      <header className="ua-topbar">
+        <div className="ua-brand-lockup">
+          <div className="ua-brand-mark"><span>U</span><span>A</span></div>
+          <div>
+            <div className="ua-brand-name">THE UNARRIVED</div>
+            <div className="ua-brand-sub">GENERATIVE IMAGE ENGINE <b>03</b></div>
+          </div>
+        </div>
+        <div className="ua-session-meta">
+          <span className="ua-live-dot" />
+          <span>LIVE GPU</span>
+          <i />
+          <span>{aspect >= 1 ? 'LANDSCAPE' : 'PORTRAIT'}</span>
+          <i />
+          <span>{activeEffectCount.toString().padStart(2,'0')} ACTIVE</span>
+        </div>
+        <div className="ua-command-bar">
+          <button className="ua-ghost-btn" onClick={() => setDockOpen(o => !o)}>
+            {dockOpen ? 'Hide looks' : 'Show looks'}
+          </button>
+          <button className={`ua-compare-btn ${compareOriginal ? 'is-active' : ''}`}
+            onPointerDown={() => setCompareOriginal(true)}
+            onPointerUp={() => setCompareOriginal(false)}
+            onPointerLeave={() => setCompareOriginal(false)}>
+            <span>◐</span> Hold original <kbd>Space</kbd>
+          </button>
+          <button className="ua-mutate-btn" onClick={mutateLook}><span>✦</span> Mutate</button>
+          <button className="ua-export-btn" disabled={params.isExportingFlag}
+            onClick={() => !params.isExportingFlag && saveRef.current?.()}>
+            {params.isExportingFlag ? 'Rendering…' : 'Export'} <span>↗</span>
+          </button>
+          {isMobile && (
+            <button className="ua-mobile-menu" onClick={() => setSidebarOpen(o => !o)} aria-label="컨트롤 열기">
+              {sidebarOpen ? '×' : '☰'}
             </button>
-          </div>
-          <div style={{ fontSize:10, color:'#5a7a9a', marginTop:2, letterSpacing:'0.02em' }}>
-            Linear · ACES · Reinhard · Color Dither
-          </div>
+          )}
         </div>
-        <div style={{ flex:1, padding:'6px 0 8px', overflowY:'auto' }} className="ua-panel">
-          {sidebarContent}
-        </div>
-      </div>
+      </header>
 
-      {isMobile && sidebarOpen && (
-        <div onClick={() => setSidebarOpen(false)}
-          style={{ position:'absolute', inset:0, zIndex:90, background:'rgba(0,0,0,0.5)' }}/>
-      )}
-
-      {/* 캔버스 */}
-      <div ref={canvasContainerRef}
-        style={{
-          flex:1, position:'relative', background:'#0a0a0a', minWidth:0,
-          width: isMobile ? '100%' : undefined, overflow:'hidden',
-          cursor: zoom > 1 ? (isPanningState ? 'grabbing' : 'grab') : 'default',
-          userSelect:'none',
-        }}
+      <div className="ua-workspace">
+        {/* 캔버스 */}
+        <main ref={canvasContainerRef} className={`ua-canvas-stage ${isDraggingFile ? 'is-file-over' : ''}`}
+        style={{ cursor: zoom > 1 ? (isPanningState ? 'grabbing' : 'grab') : 'default' }}
+        onDragEnter={e => { e.preventDefault(); setIsDraggingFile(true); }}
+        onDragOver={e => e.preventDefault()}
+        onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setIsDraggingFile(false); }}
+        onDrop={handleCanvasDrop}
         onMouseDown={e => {
           if (zoom <= 1) return;
           isPanning.current = true; setIsPanningState(true);
@@ -1803,8 +2071,7 @@ export default function App() {
           }
         }}
       >
-        <div style={{
-          width:'100%', height:'100%',
+        <div className="ua-render-surface" style={{
           transform: `scale(${zoom}) translate(${pan.x/zoom}px, ${pan.y/zoom}px)`,
           transformOrigin:'center center',
           transition: isPanningState ? 'none' : 'transform 0.18s cubic-bezier(0.22,1,0.36,1)',
@@ -1813,80 +2080,119 @@ export default function App() {
           <Canvas camera={{ position:[0,0,10], fov:43.6028 }}
             gl={{ antialias:true, preserveDrawingBuffer:true, outputColorSpace: THREE.LinearSRGBColorSpace }}>
             <Suspense fallback={null}>
-              {texture && bNoise && (
+              {texture && bNoise && curveTex && (
                 <EngineCore texture={texture} bNoise={bNoise} lut3D={lut3D || defaultLut3D}
                   patternTex={patternTex || neutralPatternTex}
-                  curveTex={curveTex || buildCurveTex(INITIAL_PARAMS.curves)}
-                  params={params} aspect={aspect} saveRef={saveRef}
+                  curveTex={curveTex}
+                  params={previewParams} aspect={aspect} saveRef={saveRef}
                   setIsExporting={setIsExporting} setExportResult={setExportResult}/>
               )}
             </Suspense>
           </Canvas>
           {!texture && (
-            <div style={{ position:'absolute', inset:0, display:'flex', flexDirection:'column',
-              alignItems:'center', justifyContent:'center', pointerEvents:'none', gap:10 }}>
-              <div style={{ fontSize:28, opacity:0.12 }}>▣</div>
-              <div style={{ fontSize:12, color:'#333' }}>이미지를 사이드바에서 불러오세요</div>
+            <div className="ua-empty-state">
+              <div className="ua-empty-icon">＋</div>
+              <strong>DROP AN IMAGE TO BEGIN</strong>
+              <span>JPG · PNG · WEBP</span>
             </div>
           )}
         </div>
 
+        <div className="ua-stage-label">
+          <span className="ua-live-dot" /> REALTIME PREVIEW
+          {compareOriginal && <b>ORIGINAL</b>}
+        </div>
+
+        {isDraggingFile && (
+          <div className="ua-drop-zone">
+            <div>＋</div><strong>DROP TO REPLACE SOURCE</strong><span>이미지는 브라우저 안에서만 처리됩니다</span>
+          </div>
+        )}
+
+        {dockOpen && (
+          <div className="ua-look-dock">
+            <div className="ua-look-heading"><span>CURATED LOOKS</span><b>{QUICK_LOOKS.length.toString().padStart(2,'0')}</b></div>
+            <div className="ua-look-list">
+              {QUICK_LOOKS.map((look, index) => (
+                <button key={look.id} className={`ua-look-card ${activeLook === look.id ? 'is-active' : ''}`}
+                  onClick={() => applyQuickLook(look)}>
+                  <span className="ua-look-swatch" style={{ background:look.swatch }}><i>{String(index+1).padStart(2,'0')}</i></span>
+                  <span><strong>{look.name}</strong><small>{look.tag}</small></span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* 줌 버튼 */}
-        <div style={{ position:'absolute', bottom:14, right:14, zIndex:50, display:'flex', flexDirection:'column', gap:4,
-          opacity: zoomVisible ? 1 : 0, pointerEvents: zoomVisible ? 'auto' : 'none', transition:'opacity 0.3s ease' }}>
-          {[4,2,1].map(lvl => (
+        <div className="ua-zoom-control">
+          {[1,2,4].map(lvl => (
             <button key={lvl}
               onClick={() => { setZoom(lvl); if (lvl===1) setPan({x:0,y:0}); else setPan(p => clampPan(p.x,p.y,lvl)); }}
-              style={{ width:36, height:28, fontSize:11, fontWeight:'700', fontFamily:'inherit', letterSpacing:'0.03em',
-                borderRadius:4, cursor:'pointer', border:'none',
-                background: zoom===lvl ? '#4a90d9' : 'rgba(20,20,20,0.82)',
-                color: zoom===lvl ? '#fff' : '#7a9ab8', backdropFilter:'blur(8px)',
-                boxShadow: zoom===lvl ? '0 0 0 1px #4a90d9' : '0 0 0 1px rgba(80,100,130,0.3)',
-                transition:'all 0.12s' }}>
+              className={zoom === lvl ? 'is-active' : ''}>
               {lvl===1 ? '1×' : `${lvl}×`}
             </button>
           ))}
           {zoom > 1 && (pan.x !== 0 || pan.y !== 0) && (
-            <button onClick={() => setPan({x:0,y:0})}
-              style={{ width:36, height:24, fontSize:14, borderRadius:4, cursor:'pointer', border:'none',
-                background:'rgba(20,20,20,0.82)', color:'#7a9ab8', backdropFilter:'blur(8px)',
-                boxShadow:'0 0 0 1px rgba(80,100,130,0.3)', transition:'all 0.12s', marginTop:2 }}>⊕</button>
+            <button onClick={() => setPan({x:0,y:0})}>⌾</button>
           )}
         </div>
         {zoom > 1 && (
-          <div style={{ position:'absolute', bottom:14, left:14, zIndex:50, fontSize:10, color:'#4a90d9',
-            letterSpacing:'0.08em', background:'rgba(10,10,10,0.75)', padding:'3px 7px', borderRadius:3,
-            backdropFilter:'blur(6px)', border:'1px solid rgba(74,144,217,0.3)', pointerEvents:'none',
-            opacity: zoomVisible ? 1 : 0, transition:'opacity 0.3s ease' }}>
-            {zoom}× — 드래그로 이동
+          <div className={`ua-pan-hint ${zoomVisible ? 'is-visible' : ''}`}>
+            {zoom}× · DRAG TO PAN
           </div>
         )}
+        </main>
+
+        {/* 인스펙터 */}
+        <aside className={`ua-inspector ${sidebarOpen ? 'is-open' : ''}`}>
+          <div className="ua-inspector-head">
+            <div>
+              <span>EFFECT THEME</span>
+              <strong>{WORKSPACES.find(w => w.id === activeWorkspace)?.label}</strong>
+            </div>
+            <button onClick={() => { if (window.confirm('모든 설정을 초기 상태로 되돌리시겠습니까?')) { setParams({ ...INITIAL_PARAMS }); setActiveLook('clean'); } }}>
+              RESET
+            </button>
+          </div>
+          <nav className="ua-workspace-tabs" aria-label="효과 카테고리">
+            {WORKSPACES.map(w => (
+              <button key={w.id} className={activeWorkspace === w.id ? 'is-active' : ''}
+                onClick={() => setActiveWorkspace(w.id)}>
+                <span>{w.icon}</span><small>{w.label}</small>
+              </button>
+            ))}
+          </nav>
+          <div className="ua-panel ua-panel-body" data-active={activeWorkspace}>
+            {sidebarContent}
+          </div>
+          <div className="ua-inspector-foot">
+            <span><i className="ua-live-dot" /> WEBGL{webgl2 ? '2' : '1'}</span>
+            <span>{activeEffectCount} EFFECTS</span>
+            <span>{params.resolution}px</span>
+          </div>
+        </aside>
+
+        {isMobile && sidebarOpen && <div className="ua-drawer-scrim" onClick={() => setSidebarOpen(false)} />}
       </div>
 
       {/* 익스포트 모달 */}
       {exportResult && (
-        <div onClick={() => setExportResult(null)}
-          style={{ position:'fixed', inset:0, zIndex:999, background:'rgba(0,0,0,0.82)',
-            display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-          <div onClick={e => e.stopPropagation()}
-            style={{ background:'#232323', border:'1px solid #383838', borderRadius:8, padding:20,
-              width:'100%', maxWidth:520, maxHeight:'90vh', display:'flex', flexDirection:'column',
-              gap:14, overflowY:'auto', boxShadow:'0 24px 64px rgba(0,0,0,0.7)' }}>
-            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-              <div style={{ fontSize:13, fontWeight:'700', color:'#e8e8e8' }}>
+        <div className="ua-export-modal" onClick={() => setExportResult(null)}>
+          <div className="ua-export-card" onClick={e => e.stopPropagation()}>
+            <div className="ua-export-title">
+              <div>
+                <span>RENDER COMPLETE</span>
+                <div>
                 추출 완료 — {exportResult.w} × {exportResult.h} px
+                </div>
               </div>
-              <button onClick={() => setExportResult(null)}
-                style={{ background:'#333', border:'1px solid #444', color:'#aaa', cursor:'pointer',
-                  fontSize:14, width:28, height:28, borderRadius:4, display:'flex', alignItems:'center', justifyContent:'center' }}>✕</button>
+              <button onClick={() => setExportResult(null)}>×</button>
             </div>
-            <img src={exportResult.dataUrl} alt="export"
-              style={{ width:'100%', maxHeight:'55vh', objectFit:'contain', borderRadius:4, border:'1px solid #2d2d2d', background:'#111' }}/>
+            <img src={exportResult.dataUrl} alt="export" />
             <a href={exportResult.dataUrl} download={`The_Unarrived_${exportResult.w}x${exportResult.h}.png`}
-              style={{ display:'block', padding:'11px 0', textAlign:'center',
-                background:'linear-gradient(180deg,#4a90d9,#2d6db0)', color:'#fff', fontWeight:'600', fontSize:12,
-                borderRadius:5, textDecoration:'none', letterSpacing:'0.04em', border:'1px solid #5aa0e9' }}>
-              ↓  PNG 다운로드
+              className="ua-download-btn">
+              DOWNLOAD PNG <span>↗</span>
             </a>
           </div>
         </div>
@@ -1897,23 +2203,24 @@ export default function App() {
 
 // ── UI 컴포넌트 ───────────────────────────────────────────────────────────────
 const C = {
-  bg:'#1e1e1e', bgDeep:'#181818', panel:'#252525',
-  line:'#2d2d2d', line2:'#333333',
-  text:'#c8c8c8', textDim:'#8a8a8a', textMute:'#555555',
-  accent:'#4a90d9', accentHi:'#6aaae9',
+  bg:'#121315', bgDeep:'#0b0c0e', panel:'#191b1e',
+  line:'#292c31', line2:'#353940',
+  text:'#f1f2f4', textDim:'#a3a8b0', textMute:'#626871',
+  accent:'#d9ff52', accentHi:'#e9ff9c',
 };
 
 const Panel = ({ label, children, accent }) => {
   const [open, setOpen] = useState(true);
   return (
-    <div style={{ borderBottom:`1px solid ${C.line}` }}>
+    <div className="ua-section" data-group={PANEL_GROUPS[label] || 'pixel'}
+      style={{ borderBottom:`1px solid ${C.line}` }}>
       <button onClick={() => setOpen(o => !o)}
         style={{ width:'100%', display:'flex', alignItems:'center', justifyContent:'space-between',
-          padding:'7px 14px', background:'none', border:'none', cursor:'pointer', color: accent ?? C.textDim }}>
-        <span style={{ fontSize:10, fontWeight:'700', letterSpacing:'0.08em', textTransform:'uppercase' }}>{label}</span>
-        <span style={{ fontSize:8, color:C.textMute, transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition:'transform 0.15s', display:'inline-block' }}>▼</span>
+          padding:'14px 18px 10px', background:'none', border:'none', cursor:'pointer', color: accent ?? C.textDim }}>
+        <span style={{ fontSize:10, fontWeight:'800', letterSpacing:'0.13em', textTransform:'uppercase' }}>{label}</span>
+        <span style={{ fontSize:12, color:C.textMute, transform: open ? 'rotate(45deg)' : 'rotate(0deg)', transition:'transform 0.2s', display:'inline-block' }}>＋</span>
       </button>
-      {open && <div style={{ padding:'4px 14px 12px' }}>{children}</div>}
+      {open && <div style={{ padding:'5px 18px 18px' }}>{children}</div>}
     </div>
   );
 };
@@ -2118,11 +2425,11 @@ const CurveEditor = ({ curves, onChange, onReset }) => {
   const activePts = curves[activeCh];
 
   // 캔버스 좌표 ↔ 커브 값 변환
-  const valToPx  = (x, y) => [PAD + (x/255)*PW, PAD + (1-(y/255))*PH];
-  const pxToVal  = (px, py) => [
+  const valToPx  = useCallback((x, y) => [PAD + (x/255)*PW, PAD + (1-(y/255))*PH], [PAD, PW, PH]);
+  const pxToVal  = useCallback((px, py) => [
     Math.round(Math.max(0, Math.min(255, (px-PAD)/PW*255))),
     Math.round(Math.max(0, Math.min(255, (1-(py-PAD)/PH)*255))),
-  ];
+  ], [PAD, PW, PH]);
 
   const getCanvasPos = useCallback((e) => {
     const rect = canvasRef.current?.getBoundingClientRect();
@@ -2250,7 +2557,7 @@ const CurveEditor = ({ curves, onChange, onReset }) => {
       ctx.fillText(label, px, PAD+PH+10);
     });
 
-  }, [curves, activeCh, activePts, hoveredIdx, draggingIdx, valToPx]);
+  }, [curves, activeCh, activePts, hoveredIdx, draggingIdx, valToPx, CW, CH, PAD, PW, PH]);
 
   // ── 이벤트 핸들러 ──────────────────────────────────────────────────────────
   const handleDown = useCallback((e) => {
@@ -2300,7 +2607,7 @@ const CurveEditor = ({ curves, onChange, onReset }) => {
 
     const newPts = activePts.map((p,i) => i===draggingIdx ? [newX, newY] : p);
     onChange({ ...curves, [activeCh]: newPts });
-  }, [draggingIdx, getCanvasPos, pxToVal, activePts, activeCh, curves, onChange]);
+  }, [draggingIdx, getCanvasPos, findPoint, pxToVal, activePts, activeCh, curves, onChange]);
 
   const handleUp = useCallback(() => { setDraggingIdx(null); }, []);
 
